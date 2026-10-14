@@ -1,0 +1,188 @@
+import os
+import json
+import requests
+from bs4 import BeautifulSoup
+from flask import Flask, jsonify
+import google.generativeai as genai
+
+app = Flask(__name__)
+
+# --- NAČÍTANIE TAJNÝCH KĽÚČOV Z PROSTREDIA ---
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+
+# Nastavenie Gemini API
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
+
+SEEN_ADS_FILE = "seen_ads.json"
+
+def load_seen_ads():
+    """Načíta zoznam už videných inzerátov."""
+    if os.path.exists(SEEN_ADS_FILE):
+        try:
+            with open(SEEN_ADS_FILE, "r") as f:
+                return json.load(f)
+        except Exception:
+            return []
+    return []
+
+def save_seen_ads(seen_ads):
+    """Uloží zoznam videných inzerátov (max 300 najnovších)."""
+    try:
+        with open(SEEN_ADS_FILE, "w") as f:
+            json.dump(seen_ads[-300:], f)
+    except Exception as e:
+        print(f"Chyba pri ukladaní seen_ads: {e}")
+
+def send_telegram_message(text):
+    """Odošle správu do Telegramu."""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("Mýbajú Telegram kľúče v Environment Variables!")
+        return
+    
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": False
+    }
+    try:
+        requests.post(url, json=payload, timeout=10)
+    except Exception as e:
+        print(f"Chyba pri odosielaní na Telegram: {e}")
+
+def analyze_ad_with_gemini(title, price, description, url, source):
+    """Pošle inzerát na vyhodnotenie do Gemini API."""
+    if not GEMINI_API_KEY:
+        print("Chýba GEMINI_API_KEY!")
+        return None
+
+    model = genai.GenerativeModel('gemini-1.5-flash')
+    
+    prompt = f"""
+    Si špičkový expert na cestné a gravel bicykle. Vyhodnoť tento inzerát z druhej ruky.
+
+    ÚDAJE O INZERÁTE:
+    - Názov: {title}
+    - Cena: {price}
+    - Zdroj: {source}
+    - Popis: {description[:1000]}
+
+    MOJE PREFERENCIE:
+    1. Typ: Cestný (Road) alebo Gravel.
+    2. Veľkosť rámu: L / 56 cm / 58 cm / 60 cm. (ODMETNI malé rámy ako S, M, 52, 54).
+    3. Cena: Ideálne do 500-600 €. Ak ide o mimoriadny celokarbón/špičkovú výbavu, akceptujem cenu do 1000 €.
+    4. Výbava: Čím viac prevodov, tým lepšie (2x10, 2x11, 2x12).
+
+    ÚLOHA:
+    Ak inzerát NESPĹŇA veľkosť rámu (je to M/S/54 a menej) alebo je predražený a nezaujímavý, odpovedaj IBA slovom: IGNORE.
+
+    Ak inzerát SPĹŇA kritériá a oplatí sa pozrieť, odpovedaj presne v tomto formáte:
+    SKÓRE: [hodnotenie 1 až 10]
+    PLUSY: [2 hlavné plusy]
+    MÍNUSY: [1-2 riziká/mínusy]
+    VERDIKT: [1-2 vety odporúčania pre kupujúceho]
+    """
+
+    try:
+        response = model.generate_content(prompt)
+        res_text = response.text.strip()
+        if "IGNORE" in res_text.upper():
+            return None
+        return res_text
+    except Exception as e:
+        print(f"Chyba pri volaní Gemini API: {e}")
+        return None
+
+def scrape_bazos():
+    """Stiahne najnovšie inzeráty cestných bicyklov z Bazoš.sk."""
+    ads = []
+    url = "https://sport.bazos.sk/bicykle/cestne/"
+    headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"}
+    
+    try:
+        r = requests.get(url, headers=headers, timeout=10)
+        soup = BeautifulSoup(r.text, 'html.parser')
+        inzeraty = soup.find_all("div", class_="inzeraty")
+        
+        for inz in inzeraty[:10]: # skontroluje prvých 10
+            title_elem = inz.find("h2", class_="nadpis")
+            if not title_elem:
+                continue
+            a_tag = title_elem.find("a")
+            ad_title = a_tag.text.strip()
+            ad_url = "https://sport.bazos.sk" + a_tag['href']
+            
+            price_elem = inz.find("div", class_="inzeratycena")
+            ad_price = price_elem.text.strip() if price_elem else "Neznáma cena"
+            
+            desc_elem = inz.find("div", class_="popis")
+            ad_desc = desc_elem.text.strip() if desc_elem else ""
+            
+            ads.append({
+                "id": ad_url,
+                "title": ad_title,
+                "price": ad_price,
+                "url": ad_url,
+                "description": ad_desc,
+                "source": "Bazoš.sk"
+            })
+    except Exception as e:
+        print(f"Chyba pri scrapovaní Bazošu: {e}")
+    return ads
+
+def run_check_job():
+    """Hlavná funkcia kontroly inzerátov."""
+    seen_ads = load_seen_ads()
+    new_found = 0
+    
+    # Získame inzeráty
+    all_ads = scrape_bazos()
+    
+    for ad in all_ads:
+        if ad["id"] in seen_ads:
+            continue # Tento inzerát sme už videli
+        
+        seen_ads.append(ad["id"])
+        print(f"Spracovávam nový inzerát: {ad['title']}")
+        
+        # Necháme Gemini vyhodnotiť inzerát
+        analysis = analyze_ad_with_gemini(
+            title=ad["title"],
+            price=ad["price"],
+            description=ad["description"],
+            url=ad["url"],
+            source=ad["source"]
+        )
+        
+        # Ak Gemini vyhodnotilo inzerát ako zaujímavý, pošleme správy na Telegram
+        if analysis:
+            msg = f"🚲 <b>NOVÝ BICYKEL NÁJDENÝ!</b> ({ad['source']})\n\n"
+            msg += f"<b>Názov:</b> {ad['title']}\n"
+            msg += f"<b>Cena:</b> {ad['price']}\n\n"
+            msg += f"🤖 <b>AI Hodnotenie:</b>\n{analysis}\n\n"
+            msg += f"🔗 <a href='{ad['url']}'>Otvoriť inzerát na {ad['source']}</a>"
+            
+            send_telegram_message(msg)
+            new_found += 1
+
+    save_seen_ads(seen_ads)
+    return new_found
+
+# --- FLASK WEB ROUTE PRE RENDER & CRON-JOB ---
+@app.route("/")
+def home():
+    return "Bike Finder Agent beží!", 200
+
+@app.route("/check")
+def check():
+    """Túto adresu zavolá cron-job.org každých 15 minút."""
+    count = run_check_job()
+    return jsonify({"status": "success", "new_ads_processed": count}), 200
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
